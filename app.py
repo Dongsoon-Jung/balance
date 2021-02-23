@@ -21,6 +21,76 @@ TX_SIGN = {
     "nw-cancel": {"use": "+", "charge": "-"}
 }
 
+
+@app.route('/balance/charge', methods=['POST', 'PUT'])
+def charge():
+    try:
+        conn = pymysql.connect(host=rds_host, user=username, password=password, database=db_name, connect_timeout=3)
+    except pymysql.MySQLError as e:
+        logger.error("ERROR: Unexpected error: Could not connect to MySQL instance.")
+        logger.error(e)
+
+    logger.info("SUCCESS: Connection to RDS MySQL instance succeeded")
+
+    request_body = app.current_request.json_body
+
+    user_id = request_body['user_id']
+    tx_type = request_body['tx_type']
+    tx_category = request_body['tx_category']
+    money_type = request_body['money_type']
+    money_balance_amount = request_body['money_balance_amount']
+    balance_sign = get_sign(tx_category, tx_type)
+
+    try:
+
+        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+            cursor.execute("insert into balance_transaction values (null, %s, now(), %s, now(), now())"
+                           , (user_id, json.dumps(request_body)))
+
+            balance_transaction_id = cursor.lastrowid
+
+            find_user_sql = '''
+                    select   a.id,
+                             a.user_id
+                      from   balance a
+                     where   a.user_id = %s
+            '''
+
+            insert_balance_sql = '''
+                insert into balance values (null, %s, %s, now(), now())
+            '''
+
+            update_balance_sql = '''
+                update balance set balance_amount = balance_amount + %s where user_id = %s
+            '''
+
+            insert_balance_history_sql = '''
+                insert into balance_history values (null, %s, %s, %s, %s, %s, %s, %s, now(), now())
+            '''
+
+            cursor.execute(find_user_sql, user_id)
+            result = cursor.fetchone()
+
+            if result:
+                cursor.execute(update_balance_sql, (money_balance_amount, user_id))
+                insert_history_data = (tx_category, tx_type, balance_sign, money_type,
+                                       money_balance_amount, result['id'],
+                                       balance_transaction_id)
+            else:
+                cursor.execute(insert_balance_sql, (user_id, money_balance_amount))
+                inserted_balance_id = cursor.lastrowid
+                insert_history_data = (tx_category, tx_type, balance_sign, money_type,
+                                       money_balance_amount, inserted_balance_id, balance_transaction_id)
+
+            cursor.execute(insert_balance_history_sql, insert_history_data)
+
+    finally:
+        conn.commit()
+        conn.close()
+
+    return {'status': 'SUCCESS'}
+
+
 @app.route('/balance', methods=['POST', 'PUT'])
 def balance():
     try:
@@ -186,6 +256,12 @@ def balance():
         conn.close()
 
     return data
+
+
+@app.route('/balance/charge/limit', methods=['GET'])
+def get_charge_limit():
+    return {'min_charge': 50000, 'max_charge': 1000000}
+
 
 def get_sign(tx_category, tx_type):
     return TX_SIGN.get(tx_category).get(tx_type)
