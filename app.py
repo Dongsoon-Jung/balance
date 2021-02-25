@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from chalice import Chalice, NotFoundError
 import pymysql
 import logging
@@ -24,6 +25,15 @@ TX_SIGN = {
 
 @app.route('/balance/charge', methods=['POST', 'PUT'])
 def charge():
+    request_body = app.current_request.json_body
+
+    user_id = request_body['user_id']
+    tx_type = request_body['tx_type']
+    tx_category = request_body['tx_category']
+    money_type = request_body['money_type']
+    money_balance_amount = request_body['money_balance_amount']
+    balance_transaction_log_id = None
+
     try:
         conn = pymysql.connect(host=rds_host, user=username, password=password, database=db_name, connect_timeout=3)
     except pymysql.MySQLError as e:
@@ -32,22 +42,13 @@ def charge():
 
     logger.info("SUCCESS: Connection to RDS MySQL instance succeeded")
 
-    request_body = app.current_request.json_body
-
-    user_id = request_body['user_id']
-    tx_type = request_body['tx_type']
-    tx_category = request_body['tx_category']
-    money_type = request_body['money_type']
-    money_balance_amount = request_body['money_balance_amount']
-    balance_sign = get_sign(tx_category, tx_type)
-
     try:
 
         with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("insert into balance_transaction values (null, %s, now(), %s, now(), now())"
+            cursor.execute("insert into balance_transaction_log values (null, %s, now(), %s, now(), now())"
                            , (user_id, json.dumps(request_body)))
 
-            balance_transaction_id = cursor.lastrowid
+            balance_transaction_log_id = cursor.lastrowid
 
             find_user_sql = '''
                     select   a.id,
@@ -58,41 +59,48 @@ def charge():
 
             insert_balance_sql = '''
                 insert into balance values (null, %s, %s, now(), now())
+                on duplicate key update 
+                balance_amount = balance_amount + %s                
             '''
 
-            update_balance_sql = '''
-                update balance set balance_amount = balance_amount + %s where user_id = %s
+            insert_balance_detail_sql = '''
+                insert into balance_detail
+                values (null, %s, %s, %s, %s, now(), now()) 
+                on duplicate key update 
+                money_balance_amount = money_balance_amount + %s
             '''
 
-            insert_balance_history_sql = '''
-                insert into balance_history values (null, %s, %s, %s, %s, %s, %s, %s, now(), now())
+            insert_balance_transaction_sql = '''
+                insert into balance_transaction values (null, %s, %s, %s, %s, %s, %s, now(), now())
             '''
 
-            cursor.execute(find_user_sql, user_id)
-            result = cursor.fetchone()
+            cursor.execute(insert_balance_sql, (user_id, money_balance_amount, money_balance_amount))
+            inserted_balance_id = cursor.lastrowid
+            cursor.execute(insert_balance_detail_sql, (user_id, money_type,
+                                                       money_balance_amount, inserted_balance_id,
+                                                       money_balance_amount))
+            insert_history_data = (tx_category, tx_type, money_type,
+                                   money_balance_amount, user_id, balance_transaction_log_id)
 
-            if result:
-                cursor.execute(update_balance_sql, (money_balance_amount, user_id))
-                insert_history_data = (tx_category, tx_type, balance_sign, money_type,
-                                       money_balance_amount, result['id'],
-                                       balance_transaction_id)
-            else:
-                cursor.execute(insert_balance_sql, (user_id, money_balance_amount))
-                inserted_balance_id = cursor.lastrowid
-                insert_history_data = (tx_category, tx_type, balance_sign, money_type,
-                                       money_balance_amount, inserted_balance_id, balance_transaction_id)
-
-            cursor.execute(insert_balance_history_sql, insert_history_data)
+            cursor.execute(insert_balance_transaction_sql, insert_history_data)
 
     finally:
         conn.commit()
         conn.close()
 
-    return {'status': 'SUCCESS'}
+    return {'status': 'SUCCESS', 'transaction_id': balance_transaction_log_id}
 
 
 @app.route('/balance', methods=['POST', 'PUT'])
 def balance():
+    request_body = app.current_request.json_body
+
+    user_id = request_body['user_id']
+    balance_detail = request_body['balance_detail']
+
+    balance_total_amount = 0
+    balance_transaction_log_id = None
+
     try:
         conn = pymysql.connect(host=rds_host, user=username, password=password, database=db_name, connect_timeout=3)
     except pymysql.MySQLError as e:
@@ -101,18 +109,8 @@ def balance():
 
     logger.info("SUCCESS: Connection to RDS MySQL instance succeeded")
 
-    data = dict()
-    sub_record = list()
-    request_body = app.current_request.json_body
-    request_method = app.current_request.method
-
-    user_id = request_body['user_id']
-    balance_detail = request_body['balance_detail']
-
-    balance_total_amount = 0
-    print(balance_detail)
     for item in balance_detail:
-        balance_sign =  get_sign(item['tx_category'], item['tx_type'])
+        balance_sign = get_sign(item['tx_category'], item['tx_type'])
         if balance_sign is None:
             raise ValueError("Input Error")
         item['balance_sign'] = balance_sign
@@ -122,96 +120,53 @@ def balance():
             balance_total_amount = balance_total_amount - item['money_balance_amount']
         else:
             raise ValueError("Input Error")
-    print(balance_detail)
-
-
-    balance_total_amount = sum([i['money_balance_amount'] for i in balance_detail])
-
-    # ( id int(11) not null auto_increment primary key,
-    #   user_id varchar(100),
-    #   tx_time timestamp,
-    #   json_str text,
-    #   created_at timestamp,
-    #   modified_at timestamp
-    # );
 
     try:
 
         with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("insert into balance_transaction values (null, %s, now(), %s, now(), now())"
+            cursor.execute("insert into balance_transaction_log values (null, %s, now(), %s, now(), now())"
                            , (user_id, json.dumps(request_body)))
 
-            balance_transaction_id = cursor.lastrowid
-
-            find_user_sql = '''
-                    select   a.id,
-                             a.user_id
-                      from   balance a
-                     where   a.user_id = %s
-            '''
-
-            insert_balance_sql = '''
-                insert into balance values (null, %s, %s, now(), now())
-            '''
+            balance_transaction_log_id = cursor.lastrowid
 
             update_balance_sql = '''
                 update balance set balance_amount = balance_amount + %s where user_id = %s
             '''
 
-            insert_balance_history_sql = '''
-                insert into balance_history values (null, %s, %s, %s, %s, %s, %s, %s, now(), now())
+            insert_balance_transaction_sql = '''
+                insert into balance_transaction values (null, %s, %s, %s, %s, %s, %s, now(), now())
             '''
 
-            cursor.execute(find_user_sql, user_id)
+            insert_balance_detail_sql = '''
+                insert into balance_detail
+                values (null, %s, %s, %s, %s, now(), now()) 
+                on duplicate key update 
+                money_balance_amount = money_balance_amount + %s
+            '''
 
-            # create table balance_history
-            # ( id int(11) not null auto_increment primary key,
-            #   tx_category varchar(20),
-            #   tx_type varchar(20),
-            #   balance_sign varchar(1),
-            #   money_type varchar(20),
-            #   money_balance_amount int(11),
-            #   balance_id int(11),
-            #   balance_transaction_id int(11),
-            #   created_at timestamp,
-            #   modified_at timestamp
-            # );
+            cursor.execute(update_balance_sql, (balance_total_amount, user_id))
+            inserted_balance_id = cursor.lastrowid
 
-            # # tx_category: normal, cancel, nw-cancel
-            # # tx_type: use, charge, trans_send, trans_recv
+            for row in balance_detail:
+                tx_category = row['tx_category']
+                tx_type = row['tx_type']
+                balance_sign = row['balance_sign']
+                money_type = row['money_type']
+                money_balance_amount = row['money_balance_amount'] * (1 if balance_sign == "+" else -1)
 
-            result = cursor.fetchone()
+                cursor.execute(insert_balance_detail_sql, (user_id, money_type,
+                                                           money_balance_amount, inserted_balance_id,
+                                                           money_balance_amount))
 
-            if result:
-                cursor.execute(update_balance_sql, (balance_total_amount, user_id))
-                for row in balance_detail:
-                    insert_history_data = (row['tx_category'],
-                                           row['tx_type'],
-                                           row['balance_sign'],
-                                           row['money_type'],
-                                           row['money_balance_amount'],
-                                           result['id'],
-                                           balance_transaction_id)
-                    cursor.execute(insert_balance_history_sql, insert_history_data)
-
-            else:
-                cursor.execute(insert_balance_sql, (user_id, balance_total_amount))
-                inserted_balance_id = cursor.lastrowid
-                for row in balance_detail:
-                    insert_history_data = (row['tx_category'],
-                                           row['tx_type'],
-                                           row['balance_sign'],
-                                           row['money_type'],
-                                           row['money_balance_amount'],
-                                           inserted_balance_id,
-                                           balance_transaction_id)
-                    cursor.execute(insert_balance_history_sql, insert_history_data)
+                insert_history_data = (tx_category, tx_type, money_type, money_balance_amount,
+                                       user_id, balance_transaction_log_id)
+                cursor.execute(insert_balance_transaction_sql, insert_history_data)
 
     finally:
         conn.commit()
         conn.close()
 
-    return {'status': 'SUCCESS'}
+    return {'status': 'SUCCESS', 'transaction_id': balance_transaction_log_id}
 
 
 @app.route('/balance', methods=['GET'])
@@ -260,7 +215,7 @@ def balance():
 
 @app.route('/balance/charge/limit', methods=['GET'])
 def get_charge_limit():
-    return {'min_charge': 50000, 'max_charge': 1000000}
+    return {'min_charge': 50000, 'max_charge': 1000000, 'charge_unit': 10000}
 
 
 def get_sign(tx_category, tx_type):
